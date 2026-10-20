@@ -327,18 +327,18 @@ if page == "Sales POS":
                 for index, item in enumerate(cart):
                     try:
                         
+                        
                         result = api_request(
-                            "POST",
+                            "GET",
                             "sell-product/",
-                            params={},
-                            payload={
-                                "p_barcode": item["barcode"],
-                                "p_customer_name": customer_name.strip(),
-                                "p_customer_number": customer_number.strip(),
-                            "p_quantity": item["quantity"],
+                            params={
+                            "barcode": item["barcode"],
+                            "customer_name": customer_name.strip(),
+                            "customer_number": customer_number.strip(),
                             },
                             requires_token=True,
                         )
+
 
 
                         completed.append({
