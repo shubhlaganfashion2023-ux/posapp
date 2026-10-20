@@ -2,7 +2,11 @@
 import os
 import requests
 import streamlit as st
-from datetime import date
+import pandas as pd
+
+# =========================================================
+# SHOWROOM POS - SINGLE FILE STREAMLIT APP
+# =========================================================
 
 st.set_page_config(
     page_title="Showroom POS",
@@ -10,36 +14,40 @@ st.set_page_config(
     layout="wide",
 )
 
-# ---------------- CONFIG ----------------
+# Your Supabase Edge Functions base URL.
+# You can also set API_BASE_URL in Streamlit Cloud Secrets.
+DEFAULT_API_BASE_URL = (
+    "https://kkdvzhwrhifjgfnrhxta.supabase.co/functions/v1"
+)
+
 try:
-    API_BASE_URL = st.secrets.get("API_BASE_URL", "")
+    API_BASE_URL = st.secrets.get(
+        "API_BASE_URL", DEFAULT_API_BASE_URL
+    ).rstrip("/")
 except Exception:
-    API_BASE_URL = ""
+    API_BASE_URL = os.getenv(
+        "API_BASE_URL", DEFAULT_API_BASE_URL
+    ).rstrip("/")
 
-API_BASE_URL = (
-    API_BASE_URL or os.getenv("API_BASE_URL", "")
-).rstrip("/")
 
-# ---------------- SIDEBAR ----------------
-with st.sidebar:
-    st.title("🛍️ Showroom POS")
+# =========================================================
+# SESSION STATE
+# =========================================================
 
-    page = st.radio(
-        "Navigation",
-        ["Sales POS", "Inventory", "Management"],
-    )
+if "cart" not in st.session_state:
+    st.session_state.cart = []
 
-    st.divider()
-    st.subheader("API Access")
+if "found_product" not in st.session_state:
+    st.session_state.found_product = None
 
-    api_token = st.text_input(
-        "API Token",
-        type="password",
-        placeholder="Enter API token",
-        help="Protected API actions require a valid token.",
-    )
+if "last_api_result" not in st.session_state:
+    st.session_state.last_api_result = None
 
-# ---------------- API CLIENT ----------------
+
+# =========================================================
+# API HELPER
+# =========================================================
+
 def api_request(
     method,
     endpoint,
@@ -47,280 +55,480 @@ def api_request(
     payload=None,
     requires_token=True,
 ):
-    if not API_BASE_URL:
-        raise RuntimeError(
-            "API_BASE_URL is missing. Configure it in Streamlit Cloud Secrets."
+    """Call a Supabase Edge Function and return JSON."""
+
+    token = st.session_state.get("api_token", "").strip()
+
+    if requires_token and not token:
+        raise ValueError(
+            "Enter your API token in the sidebar before continuing."
         )
 
-    if requires_token and not api_token.strip():
-        raise RuntimeError(
-            "Enter your API token in the sidebar before using this function."
-        )
+    url = f"{API_BASE_URL}/{endpoint.lstrip('/')}"
 
-    request_params = dict(params or {})
-    headers = {}
+    query_params = dict(params or {})
 
-    # Your previously shared create-product URL uses ?token=...
+    # Existing API uses the custom 'token' query parameter.
     if requires_token:
-        request_params["token"] = api_token.strip()
+        query_params["token"] = token
 
     response = requests.request(
-        method=method,
-        url=f"{API_BASE_URL}/{endpoint.lstrip('/')}",
-        params=request_params,
+        method=method.upper(),
+        url=url,
+        params=query_params,
         json=payload,
-        headers=headers,
-        timeout=25,
+        timeout=20,
     )
-
-    response.raise_for_status()
-
-    if not response.content:
-        return None
 
     try:
-        return response.json()
+        data = response.json()
     except ValueError:
-        return response.text
+        data = {"message": response.text}
+
+    if not response.ok:
+        message = (
+            data.get("error")
+            or data.get("message")
+            or data.get("detail")
+            or str(data)
+        )
+        raise RuntimeError(
+            f"API returned HTTP {response.status_code}: {message}"
+        )
+
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(
+            data.get("error")
+            or data.get("message")
+            or "The API reported that the operation failed."
+        )
+
+    return data
 
 
-def show_api_result(result):
-    if isinstance(result, (dict, list)):
-        st.json(result)
-    else:
-        st.write(result)
+def money(value):
+    try:
+        return f"₹{float(value or 0):,.2f}"
+    except (TypeError, ValueError):
+        return "₹0.00"
 
 
-# ---------------- SALES POS ----------------
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+st.sidebar.title("🛍️ Showroom POS")
+st.sidebar.caption("Sales • Inventory • Management")
+
+page = st.sidebar.radio(
+    "Navigation",
+    ["Sales POS", "Inventory", "Management"],
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("API Connection")
+
+st.sidebar.text_input(
+    "API Token",
+    type="password",
+    key="api_token",
+    placeholder="Enter your API token",
+    help="Used for API requests that require token authentication.",
+)
+
+st.sidebar.caption("API URL")
+st.sidebar.code(API_BASE_URL, language=None)
+
+if not st.session_state.api_token.strip():
+    st.sidebar.warning("Enter your API token to use protected APIs.")
+else:
+    st.sidebar.success("API token entered")
+
+
+# =========================================================
+# SALES POS
+# =========================================================
+
 if page == "Sales POS":
-    st.title("🛒 Sales POS")
-    st.caption("Showroom billing counter")
+    st.title("Sales POS")
+    st.caption("Find products by barcode and prepare a sale.")
 
-    st.subheader("Add product to bill")
-
-    barcode = st.text_input(
-        "Barcode",
-        placeholder="Scan or enter barcode",
-        key="sales_barcode",
-    )
-
-    quantity = st.number_input(
-        "Quantity",
-        min_value=1,
-        value=1,
-        step=1,
-        key="sales_quantity",
-    )
-
-    if st.button("Look up product", use_container_width=True):
-        st.warning(
-            "Product lookup is not connected yet. Configure your existing "
-            "product-search endpoint before enabling this action."
-        )
-
-    st.divider()
-    st.subheader("Current Bill")
-    st.info(
-        "The cart, totals, payment collection, stock deduction and receipt "
-        "will be connected to your existing sales API."
-    )
-
-    st.button(
-        "Complete Sale",
-        disabled=True,
-        use_container_width=True,
-        help="Enable after connecting the actual sales endpoint.",
-    )
-
-
-# ---------------- INVENTORY ----------------
-elif page == "Inventory":
-    st.title("📦 Inventory Management")
-    st.caption("Create products using your existing API")
-
-    with st.form("create_product_form"):
+    with st.form("product_lookup_form"):
         barcode = st.text_input(
-            "Barcode",
-            placeholder="Enter product barcode",
+            "Scan or enter product barcode",
+            placeholder="e.g. 0001",
         )
-        name = st.text_input(
-            "Product Name",
-            placeholder="e.g. Suit",
-        )
-        category = st.text_input(
-            "Category",
-            placeholder="e.g. Suit",
-        )
-        price = st.number_input(
-            "Selling Price (₹)",
-            min_value=0.0,
-            step=100.0,
-            format="%.2f",
-        )
-
-        submitted = st.form_submit_button(
-            "Create Product",
+        find_product = st.form_submit_button(
+            "Find Product",
+            type="primary",
             use_container_width=True,
         )
 
-    if submitted:
-        if not all([barcode.strip(), name.strip(), category.strip()]):
-            st.error("Please fill in the barcode, name and category.")
-        elif price <= 0:
-            st.error("Price must be greater than zero.")
-        elif not api_token.strip():
-            st.error("Enter your API token in the sidebar.")
+    if find_product:
+        if not barcode.strip():
+            st.warning("Please enter a barcode.")
         else:
             try:
-                with st.spinner("Creating product..."):
-                    result = api_request(
-                        "GET",
-                        "create-product/",
-                        params={
-                            "bardcode": barcode.strip(),
-                            "price": price,
-                            "name": name.strip(),
-                            "category": category.strip(),
-                        },
-                        requires_token=True,
+                result = api_request(
+                    "GET",
+                    "products/",
+                    params={"barcode": barcode.strip()},
+                    requires_token=True,
+                )
+
+                product = result.get("product")
+
+                if result.get("success") and isinstance(product, dict):
+                    st.session_state.found_product = product
+                    st.success("Product found.")
+                else:
+                    st.session_state.found_product = None
+                    st.warning("Product was not found.")
+
+            except Exception as exc:
+                st.error(f"Product lookup failed: {exc}")
+
+    product = st.session_state.found_product
+
+    if product:
+        st.divider()
+        st.subheader("Product Details")
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric("Product", product.get("name", "Unknown"))
+        col2.metric("Price", money(product.get("price")))
+        col3.metric("Barcode", str(product.get("barcode", "")))
+
+        st.write("**Category:**", product.get("category") or "—")
+
+        with st.form("add_to_cart_form"):
+            quantity = st.number_input(
+                "Quantity",
+                min_value=1,
+                max_value=999,
+                value=1,
+                step=1,
+            )
+
+            add_to_cart = st.form_submit_button(
+                "Add to Cart",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if add_to_cart:
+            barcode_value = str(product.get("barcode", "")).strip()
+
+            if not barcode_value:
+                st.error("The API product response has no barcode.")
+            else:
+                # Increase quantity if this product is already in the cart.
+                existing = next(
+                    (
+                        item
+                        for item in st.session_state.cart
+                        if str(item["barcode"]) == barcode_value
+                    ),
+                    None,
+                )
+
+                if existing:
+                    existing["quantity"] += int(quantity)
+                else:
+                    st.session_state.cart.append(
+                        {
+                            "barcode": barcode_value,
+                            "name": product.get("name", "Unknown"),
+                            "price": float(product.get("price") or 0),
+                            "quantity": int(quantity),
+                        }
                     )
 
-                st.success("Product API request completed.")
-                show_api_result(result)
+                st.success("Product added to cart.")
 
-            except requests.HTTPError as exc:
-                st.error(f"API returned an HTTP error: {exc}")
-                if exc.response is not None:
-                    st.code(exc.response.text[:2000])
+    st.divider()
+    st.subheader("Current Cart")
+
+    cart = st.session_state.cart
+
+    if cart:
+        cart_rows = []
+
+        for item in cart:
+            cart_rows.append(
+                {
+                    "Barcode": item["barcode"],
+                    "Product": item["name"],
+                    "Price": money(item["price"]),
+                    "Quantity": item["quantity"],
+                    "Subtotal": money(
+                        item["price"] * item["quantity"]
+                    ),
+                }
+            )
+
+        st.dataframe(
+            pd.DataFrame(cart_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        total = sum(
+            item["price"] * item["quantity"]
+            for item in cart
+        )
+
+        st.metric("Cart Total", money(total))
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("Clear Cart", use_container_width=True):
+                st.session_state.cart = []
+                st.rerun()
+
+        with col2:
+            checkout = st.button(
+                "Complete Sale",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if checkout:
+            if not st.session_state.api_token.strip():
+                st.error("Enter your API token in the sidebar.")
+            else:
+                st.warning(
+                    "Checkout sends one request per cart item. "
+                    "If a request fails after an earlier item succeeds, "
+                    "the sale may be partially processed. Verify your "
+                    "sell-product function supports barcode and quantity "
+                    "query parameters before using this for real sales."
+                )
+
+                completed = []
+                failed = []
+
+                progress = st.progress(0)
+
+                for index, item in enumerate(cart):
+                    try:
+                        # Assumes sell-product accepts these query parameters.
+                        # Change this request if your Edge Function expects
+                        # a different HTTP method or parameter names.
+                        result = api_request(
+                            "GET",
+                            "sell-product/",
+                            params={
+                                "barcode": item["barcode"],
+                                "quantity": item["quantity"],
+                            },
+                            requires_token=True,
+                        )
+
+                        completed.append(
+                            {
+                                "product": item["name"],
+                                "quantity": item["quantity"],
+                                "result": result,
+                            }
+                        )
+
+                    except Exception as exc:
+                        failed.append(
+                            f"{item['name']} ({item['barcode']}): {exc}"
+                        )
+
+                    progress.progress((index + 1) / len(cart))
+
+                if completed:
+                    st.success(
+                        f"{len(completed)} cart item(s) processed "
+                        "without an API error."
+                    )
+                    with st.expander("API responses"):
+                        for item in completed:
+                            st.write(
+                                item["product"],
+                                "— quantity:",
+                                item["quantity"],
+                            )
+                            st.json(item["result"])
+
+                if failed:
+                    st.error("Some checkout requests failed.")
+                    for message in failed:
+                        st.write(f"- {message}")
+
+                # Clear only if every request succeeded.
+                if completed and not failed:
+                    st.session_state.cart = []
+                    st.session_state.found_product = None
+                    st.rerun()
+
+    else:
+        st.info("Your cart is empty. Find a product and add it here.")
+
+
+# =========================================================
+# INVENTORY
+# =========================================================
+
+elif page == "Inventory":
+    st.title("Inventory")
+    st.caption("Create a product in your Supabase database.")
+
+    st.subheader("Add New Product")
+
+    with st.form("create_product_form", clear_on_submit=False):
+        new_barcode = st.text_input(
+            "Barcode",
+            placeholder="e.g. 0002",
+        )
+
+        new_name = st.text_input(
+            "Product Name",
+            placeholder="e.g. Men's suit",
+        )
+
+        new_price = st.number_input(
+            "Price (₹)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+        )
+
+        new_category = st.text_input(
+            "Category",
+            placeholder="e.g. suit",
+        )
+
+        create_product = st.form_submit_button(
+            "Create Product",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if create_product:
+        if not new_barcode.strip():
+            st.warning("Barcode is required.")
+        elif not new_name.strip():
+            st.warning("Product name is required.")
+        elif not new_category.strip():
+            st.warning("Category is required.")
+        else:
+            try:
+                # Your previously supplied create-product URL used
+                # the parameter spelling 'bardcode'.
+                result = api_request(
+                    "GET",
+                    "create-product/",
+                    params={
+                        "bardcode": new_barcode.strip(),
+                        "price": new_price,
+                        "name": new_name.strip(),
+                        "category": new_category.strip(),
+                    },
+                    requires_token=True,
+                )
+
+                st.success("Create-product API request succeeded.")
+                st.json(result)
 
             except Exception as exc:
                 st.error(f"Product creation failed: {exc}")
 
     st.divider()
-    st.subheader("Product Catalogue")
+    st.subheader("Find Existing Product")
+
+    with st.form("inventory_lookup_form"):
+        inventory_barcode = st.text_input(
+            "Barcode to look up",
+            placeholder="e.g. 0001",
+        )
+
+        inventory_lookup = st.form_submit_button("Look Up Product")
+
+    if inventory_lookup:
+        if not inventory_barcode.strip():
+            st.warning("Enter a barcode.")
+        else:
+            try:
+                result = api_request(
+                    "GET",
+                    "products/",
+                    params={"barcode": inventory_barcode.strip()},
+                    requires_token=True,
+                )
+
+                if result.get("success") and result.get("product"):
+                    st.json(result["product"])
+                else:
+                    st.warning("Product was not found.")
+
+            except Exception as exc:
+                st.error(f"Inventory lookup failed: {exc}")
+
     st.info(
-        "Product listing, editing, stock adjustments and low-stock alerts "
-        "require the corresponding existing API endpoint details."
+        "The product creation request uses the 'bardcode' parameter "
+        "from your existing API URL. Product lookup uses 'barcode'."
     )
 
 
-# ---------------- MANAGEMENT ----------------
+# =========================================================
+# MANAGEMENT
+# =========================================================
+
 elif page == "Management":
-    st.title("📊 Management")
-    st.caption("Daily sales, expenses and closing balance")
+    st.title("Management")
+    st.caption("API diagnostics and management tools.")
 
-    col1, col2, col3 = st.columns(3)
+    st.subheader("Test Product API")
 
-    col1.metric("Today's Sales", "—")
-    col2.metric("Today's Expenses", "—")
-    col3.metric("Expected Closing Cash", "—")
+    test_barcode = st.text_input(
+        "Barcode for API test",
+        value="0001",
+        key="management_test_barcode",
+    )
+
+    if st.button("Test API Connection", type="primary"):
+        if not test_barcode.strip():
+            st.warning("Enter a barcode to test.")
+        else:
+            try:
+                result = api_request(
+                    "GET",
+                    "products/",
+                    params={"barcode": test_barcode.strip()},
+                    requires_token=True,
+                )
+
+                st.success("The products endpoint responded successfully.")
+                st.json(result)
+
+            except Exception as exc:
+                st.error(f"API test failed: {exc}")
 
     st.divider()
+    st.subheader("Additional Management Features")
 
-    tab1, tab2, tab3 = st.tabs(
-        ["Daily Summary", "Add Expense", "Day Closing"]
+    st.info(
+        "Sales reports, expenses, cash closing, and product updates "
+        "are not connected yet. These require the exact request formats "
+        "and response structures of your existing Supabase functions."
     )
 
-    with tab1:
-        st.subheader("Daily Sales Summary")
-        st.info(
-            "Connect the existing reporting endpoint to display sales "
-            "totals and cash, UPI and card collections."
-        )
+    st.caption(
+        "Available endpoint names in this app: products, create-product, "
+        "sell-product. The update-product endpoint has not been wired "
+        "because its required parameters have not been confirmed."
+    )
 
-    with tab2:
-        st.subheader("Record Expense")
 
-        with st.form("expense_form"):
-            expense_date = st.date_input(
-                "Expense Date",
-                value=date.today(),
-            )
+# =========================================================
+# FOOTER
+# =========================================================
 
-            expense_category = st.selectbox(
-                "Category",
-                [
-                    "Rent",
-                    "Salary",
-                    "Transport",
-                    "Electricity",
-                    "Supplies",
-                    "Other",
-                ],
-            )
-
-            expense_amount = st.number_input(
-                "Amount (₹)",
-                min_value=0.0,
-                step=50.0,
-            )
-
-            expense_note = st.text_input(
-                "Description",
-                placeholder="Expense details",
-            )
-
-            expense_submitted = st.form_submit_button(
-                "Save Expense",
-                use_container_width=True,
-            )
-
-        if expense_submitted:
-            st.warning(
-                "Expense not saved. Connect this form to your existing "
-                "expense API before using it for real accounts."
-            )
-
-    with tab3:
-        st.subheader("End-of-Day Closing")
-
-        opening_cash = st.number_input(
-            "Opening Cash (₹)",
-            min_value=0.0,
-            step=100.0,
-        )
-
-        cash_sales = st.number_input(
-            "Cash Sales (₹)",
-            min_value=0.0,
-            step=100.0,
-        )
-
-        cash_expenses = st.number_input(
-            "Cash Expenses (₹)",
-            min_value=0.0,
-            step=100.0,
-        )
-
-        withdrawals = st.number_input(
-            "Cash Withdrawals (₹)",
-            min_value=0.0,
-            step=100.0,
-        )
-
-        expected_closing = (
-            opening_cash + cash_sales - cash_expenses - withdrawals
-        )
-
-        st.metric(
-            "Expected Closing Cash",
-            f"₹{expected_closing:,.2f}",
-        )
-
-        actual_closing = st.number_input(
-            "Actual Counted Cash (₹)",
-            min_value=0.0,
-            step=100.0,
-        )
-
-        difference = actual_closing - expected_closing
-
-        st.metric(
-            "Cash Difference",
-            f"₹{difference:,.2f}",
-        )
-
-        st.info(
-            "Closing balances are currently calculated on screen only. "
-            "Connect your existing closing API to save them permanently."
-        )
+st.sidebar.divider()
+st.sidebar.caption("Showroom POS • Supabase API")
