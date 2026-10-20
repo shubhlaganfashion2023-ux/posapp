@@ -333,8 +333,8 @@ if page == "Sales POS":
                             "sell-product/",
                             params={
                             "barcode": item["barcode"],
-                            "name": customer_name.strip(),
-                            "number": customer_number.strip(),
+                            "customer_name": customer_name.strip(),
+                            "customer_number": customer_number.strip(),
                             },
                             requires_token=True,
                         )
